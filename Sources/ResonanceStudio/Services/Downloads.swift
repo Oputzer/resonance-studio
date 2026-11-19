@@ -9,7 +9,10 @@ final class DownloadJob: ObservableObject, Identifiable {
 
     let id = UUID()
     let url: String
-    let format: AudioFormat
+    @Published var format: AudioFormat
+    /// True when this link was already in the library, so only new songs are downloaded.
+    @Published var isUpdate = false
+    @Published var playlistID: String?
 
     @Published var state: State = .preparing
     @Published var title = "Reading link…"
@@ -52,6 +55,11 @@ final class DownloadJob: ObservableObject, Identifiable {
             return "\(min(completed + 1, total)) of \(total)\(current)"
         case .finishing: return "Saving song details…"
         case .done:
+            if isUpdate {
+                return completed == 0
+                    ? "Already up to date. No new songs since your last download."
+                    : "\(completed) new \(completed == 1 ? "song" : "songs") added · \(format.title) · Folder renamed to today's date"
+            }
             return "\(completed) \(completed == 1 ? "song" : "songs") · \(format.title) · Saved to \(Paths.displayLibraryPath)"
         case .failed(let message): return message
         case .cancelled: return completed > 0 ? "Stopped after \(completed) \(completed == 1 ? "song" : "songs")" : "Cancelled"
@@ -62,7 +70,7 @@ final class DownloadJob: ObservableObject, Identifiable {
         let parts = line.components(separatedBy: "\t")
         switch parts.first {
         case "ITEM" where parts.count >= 5:
-            if let n = Int(parts[3]), n > 0 { total = n }
+            if !isUpdate, let n = Int(parts[3]), n > 0 { total = n }
             currentTitle = parts[4...].joined(separator: " ")
             currentProgress = 0
         case "PROG" where parts.count >= 4:
@@ -105,7 +113,8 @@ final class DownloadJob: ObservableObject, Identifiable {
 @MainActor
 final class DownloadCenter: ObservableObject {
     @Published private(set) var jobs: [DownloadJob] = []
-    @Published var openRequest: URL?
+    /// Playlist id the main window should switch to.
+    @Published var openRequest: String?
 
     private weak var library: Library?
 
@@ -148,9 +157,14 @@ final class DownloadCenter: ObservableObject {
             let probe = try await Downloader.probe(url: job.url, tools: tools)
             if job.state == .cancelled { return }
             job.title = probe.title
-            job.total = probe.count
             job.titlesByID = probe.titlesByID
 
+            if let existing = library?.playlist(sourceID: probe.sourceID, url: probe.webpageURL ?? job.url) {
+                try await update(existing, job: job, probe: probe, tools: tools)
+                return
+            }
+
+            job.total = probe.count
             let folder = try Downloader.makeFolder(for: probe.title)
             job.folder = folder
 
@@ -163,24 +177,98 @@ final class DownloadCenter: ObservableObject {
             }
             let wasCancelled = job.state == .cancelled
             job.state = .finishing
-            let manifest = Downloader.buildManifest(job: job, probe: probe, folder: folder)
+            var manifest = Downloader.buildManifest(job: job, probe: probe, folder: folder)
             guard !manifest.tracks.isEmpty else {
                 try? FileManager.default.removeItem(at: folder)
                 let reason = job.failures.first.map { $0.components(separatedBy: ": ").dropFirst().joined(separator: ": ") }
                 job.state = .failed(reason?.nilIfBlank ?? job.failures.first ?? "No songs could be downloaded. The uploader may have blocked them.")
                 return
             }
+            manifest.uid = UUID().uuidString
+            manifest.sourceID = probe.sourceID
+            manifest.updatedAt = Date()
             try manifest.save(to: folder)
             if job.format == .wav {
                 await Downloader.tagWAVFiles(folder: folder, manifest: manifest)
             }
             job.coverURL = LibraryPlaylist(folder: folder, manifest: manifest).coverURL
+            job.playlistID = manifest.uid
             library?.reload()
             job.state = wasCancelled ? .cancelled : .done
-            library?.enrich(folder: folder)
+            if let id = manifest.uid { library?.enrich(id) }
+            library?.analyzePending()
         } catch {
             if job.state != .cancelled { job.state = .failed(error.localizedDescription) }
         }
+    }
+}
+
+extension DownloadCenter {
+    /// The link is already in the library: download only songs that are new on SoundCloud,
+    /// add them after the existing ones, and rename the folder with today's date.
+    fileprivate func update(_ existing: LibraryPlaylist, job: DownloadJob, probe: Probe, tools: Tools) async throws {
+        guard let library else { return }
+        job.isUpdate = true
+        job.format = existing.manifest.format
+        job.playlistID = existing.id
+        job.folder = existing.folder
+        job.coverURL = existing.coverURL
+
+        let have = Set(existing.manifest.tracks.map(\.id)).union(existing.manifest.removedIDs ?? [])
+        let fresh = probe.entryIDs.filter { !have.contains($0) }
+        job.total = fresh.count
+        guard !fresh.isEmpty else {
+            job.state = .done
+            return
+        }
+
+        // yt-dlp skips anything listed in this archive.
+        let archive = existing.folder.appendingPathComponent(".resonance/archive.txt")
+        try? FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try have.map { "soundcloud \($0)" }.joined(separator: "\n").appending("\n").write(to: archive, atomically: true, encoding: .utf8)
+
+        job.state = .downloading
+        _ = try await Downloader.download(job: job, folder: existing.folder, tools: tools,
+                                          isPlaylist: probe.isPlaylist, archive: archive)
+        guard !job.saved.isEmpty else {
+            if job.state != .cancelled {
+                job.state = job.failures.isEmpty ? .done : .failed(job.failures.first ?? "No new songs could be downloaded.")
+            }
+            return
+        }
+        let wasCancelled = job.state == .cancelled
+        job.state = .finishing
+
+        var added: [TrackMeta] = []
+        library.mutate(existing.id) { m, folder in
+            var next = (m.tracks.map(\.index).max() ?? 0) + 1
+            let incoming = Downloader.tracks(job: job, folder: folder).sorted { $0.index < $1.index }
+            for var t in incoming where !m.tracks.contains(where: { $0.id == t.id }) {
+                t.index = next
+                next += 1
+                m.tracks.append(t)
+                added.append(t)
+            }
+            m.title = probe.title
+            m.updatedAt = Date()
+            if m.sourceID == nil { m.sourceID = probe.sourceID }
+            library.renumberFiles(&m, folder: folder)
+        }
+        library.renameFolder(of: existing.id, to: Library.datedName(probe.title, date: Date()))
+
+        if let current = library.playlist(id: existing.id) {
+            job.folder = current.folder
+            if job.format == .wav {
+                let ids = Set(added.map(\.id))
+                var subset = current.manifest
+                subset.tracks = current.manifest.tracks.filter { ids.contains($0.id) }
+                await Downloader.tagWAVFiles(folder: current.folder, manifest: subset)
+            }
+        }
+        library.reload()
+        job.state = wasCancelled ? .cancelled : .done
+        library.enrich(existing.id)
+        library.analyzePending()
     }
 }
 
@@ -191,6 +279,9 @@ struct Probe {
     var count: Int
     var isPlaylist: Bool
     var titlesByID: [String: String]
+    var entryIDs: [String]
+    var sourceID: String?
+    var webpageURL: String?
 }
 
 enum Downloader {
@@ -205,8 +296,11 @@ enum Downloader {
         let entries = isPlaylist ? (obj["entries"] as? [[String: Any]] ?? []) : [obj]
         let count = entries.count
         var titles: [String: String] = [:]
+        var ids: [String] = []
         for e in entries {
-            if let id = (e["id"] as? String) ?? (e["id"] as? NSNumber)?.stringValue, let t = e["title"] as? String { titles[id] = t }
+            guard let id = (e["id"] as? String) ?? (e["id"] as? NSNumber)?.stringValue else { continue }
+            ids.append(id)
+            if let t = e["title"] as? String { titles[id] = t }
         }
         if count == 0 {
             throw AppError("This playlist has no downloadable songs. The uploader may have blocked them.")
@@ -217,7 +311,10 @@ enum Downloader {
             description: (obj["description"] as? String)?.nilIfBlank,
             count: count,
             isPlaylist: isPlaylist,
-            titlesByID: titles
+            titlesByID: titles,
+            entryIDs: ids,
+            sourceID: (obj["id"] as? String) ?? (obj["id"] as? NSNumber)?.stringValue,
+            webpageURL: obj["webpage_url"] as? String
         )
     }
 
@@ -244,7 +341,7 @@ enum Downloader {
     }
 
     @MainActor
-    static func download(job: DownloadJob, folder: URL, tools: Tools, isPlaylist: Bool) async throws -> Int32 {
+    static func download(job: DownloadJob, folder: URL, tools: Tools, isPlaylist: Bool, archive: URL? = nil) async throws -> Int32 {
         var args = [
             "--yes-playlist", "--ignore-errors", "--no-overwrites", "--newline", "--progress",
             "--no-simulate", "--color", "no_color",
@@ -261,6 +358,7 @@ enum Downloader {
                      "--parse-metadata", "playlist_title:(?P<album>.+)"]
         }
         if job.format.embedsArtwork { args.append("--embed-thumbnail") }
+        if let archive { args += ["--download-archive", archive.path] }
         args += [
             "--print", "before_dl:ITEM\t%(id)s\t%(playlist_index|1)s\t%(n_entries|1)s\t%(title)s",
             "--print", "after_move:SAVED\t%(id)s\t%(filepath)s",
@@ -278,8 +376,9 @@ enum Downloader {
                                       onLine: { line in MainActor.assumeIsolated { job.handle(line) } })
     }
 
+    /// Song details for everything this job saved, read from yt-dlp's info files.
     @MainActor
-    static func buildManifest(job: DownloadJob, probe: Probe, folder: URL) -> PlaylistManifest {
+    static func tracks(job: DownloadJob, folder: URL) -> [TrackMeta] {
         let infoDir = folder.appendingPathComponent(".resonance/info")
         let artDir = folder.appendingPathComponent(".resonance/art")
         var tracks: [TrackMeta] = []
@@ -290,7 +389,13 @@ enum Downloader {
             tracks.append(track(from: info, id: id, fallbackIndex: position + 1,
                                 fileName: URL(fileURLWithPath: path).lastPathComponent, artworkFile: art))
         }
-        tracks.sort { $0.index < $1.index }
+        return tracks.sorted { $0.index < $1.index }
+    }
+
+    @MainActor
+    static func buildManifest(job: DownloadJob, probe: Probe, folder: URL) -> PlaylistManifest {
+        let infoDir = folder.appendingPathComponent(".resonance/info")
+        let tracks = tracks(job: job, folder: folder)
         let playlistInfo = readJSON(infoDir.appendingPathComponent("playlist.info.json"))
         return PlaylistManifest(
             title: probe.title,
@@ -359,7 +464,11 @@ enum Downloader {
             fileName: fileName,
             artworkFile: artworkFile,
             catalog: nil,
-            catalogChecked: nil
+            catalogChecked: nil,
+            analysis: nil,
+            analysisVersion: nil,
+            analysisEdited: nil,
+            folder: nil
         )
     }
 }

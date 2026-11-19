@@ -8,13 +8,14 @@ struct SettingsView: View {
             AccountSettings().tabItem { Label("Account", systemImage: "person.crop.circle") }
             AboutSettings().tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 520, height: 340)
+        .frame(width: 560, height: 400)
     }
 }
 
 private struct GeneralSettings: View {
     @EnvironmentObject private var library: Library
     @AppStorage("defaultFormat") private var formatRaw = AudioFormat.original.rawValue
+    @AppStorage("tempoRange") private var tempoRaw = TempoRange.automatic.rawValue
     @State private var location = Paths.libraryRoot
     @EnvironmentObject private var installer: ToolInstaller
 
@@ -23,6 +24,13 @@ private struct GeneralSettings: View {
             Picker("Default format", selection: $formatRaw) {
                 ForEach(AudioFormat.allCases) { Text($0.title).tag($0.rawValue) }
             }
+            Picker(selection: $tempoRaw) {
+                ForEach(TempoRange.allCases) { Text($0.title).tag($0.rawValue) }
+            } label: {
+                Text("BPM range")
+                Text("Half and double tempo are the same beat. Pick the range your music lives in.")
+            }
+            .onChange(of: tempoRaw) { _, _ in library.applyTempoRange() }
             LabeledContent("Library folder") {
                 VStack(alignment: .trailing, spacing: 6) {
                     Text(location.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))

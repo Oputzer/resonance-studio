@@ -31,6 +31,10 @@ Prefer a zip? Download `Resonance-Studio-<version>.zip` instead, double-click it
 - **Five formats.** Original (the untouched source stream, best quality), MP3 320 kbps, AAC, WAV, and FLAC.
 - **Cover art inside every file.** Full-resolution artwork is embedded directly in each song, in every format, including WAV (as an ID3 tag, the standard that most DJ and music-tagging apps read).
 - **Rich song details.** Artist, genre, upload date, plays, likes, reposts, license, and description from SoundCloud. When a song is also in Apple's music catalog, Resonance Studio adds the official album name, release date, track number, and a high-resolution album cover.
+- **BPM and key for every song.** Detected automatically after each download, shown as a tempo and a color-coded Camelot key (8A, 11B…). Select a song and keys that don't mix with it fade out. Pick the BPM range your music lives in, and fix any value by hand with a right-click.
+- **Sort by anything.** Title, artist, BPM, key, length, genre, release date. Like a sorted order? Make it the playlist order with one click.
+- **Organize your sets.** Drag songs to reorder them. Split a playlist into folders like Warm-up, Peak and Closing. Build **sets** from songs in any playlist; copies share storage with the originals, so they take up almost no extra space. **Arrange for Mixing** orders songs so each one flows into the next by key and tempo. The files on disk are renumbered to match, so the order is the same in Finder and on a USB stick.
+- **Updates, not duplicates.** Add a playlist you already have and only the new songs are downloaded. They're added at the end, and the folder is renamed with the date of the update. Songs you deleted aren't brought back.
 - **A real library.** Browse every playlist you've saved, see song details in an info panel, and play songs right inside the app.
 - **A simple folder system.** Everything lives in a `Resonance Studio` folder on your Desktop, created automatically, with one folder per download, named with the playlist and the date:
 
@@ -38,8 +42,11 @@ Prefer a zip? Download `Resonance-Studio-<version>.zip` instead, double-click it
   Desktop/
   └── Resonance Studio/
       └── Late Night Drive — 2026-11-18/
-          ├── 01 - First Song.mp3
-          └── 02 - Second Song.mp3
+          ├── Warm-up/
+          │   ├── 01 - First Song.mp3
+          │   └── 02 - Second Song.mp3
+          ├── 01 - Third Song.mp3
+          └── 02 - Fourth Song.mp3
   ```
 
   Click **Show in Finder** on any playlist or song to jump straight to it.

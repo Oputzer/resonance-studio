@@ -4,7 +4,17 @@ import Foundation
 @MainActor
 final class Library: ObservableObject {
     @Published private(set) var playlists: [LibraryPlaylist] = []
-    @Published private(set) var enriching: Set<URL> = []
+    /// Playlist ids whose song details are being looked up.
+    @Published private(set) var enriching: Set<String> = []
+    /// "playlistID/trackID" for songs whose BPM and key are being worked out right now.
+    @Published private(set) var analyzing: Set<String> = []
+    @Published var lastError: String?
+
+    weak var player: Player?
+
+    private var analysisQueue: [(playlist: String, track: String)] = []
+    private var queued: Set<String> = []
+    private var analysisWorkers = 0
 
     init() { reload() }
 
@@ -15,15 +25,65 @@ final class Library: ObservableObject {
         let folders = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey],
                                                    options: [.skipsHiddenFiles])) ?? []
         let found = folders.compactMap { folder -> LibraryPlaylist? in
-            guard let manifest = PlaylistManifest.load(from: folder) else { return nil }
+            guard var manifest = PlaylistManifest.load(from: folder) else { return nil }
+            if manifest.uid == nil {
+                manifest.uid = UUID().uuidString
+                try? manifest.save(to: folder)
+            }
             return LibraryPlaylist(folder: folder, manifest: manifest)
         }
-        let sorted = found.sorted { $0.manifest.downloadedAt > $1.manifest.downloadedAt }
+        let sorted = found.sorted { $0.manifest.lastChanged > $1.manifest.lastChanged }
         if sorted != playlists { playlists = sorted }
     }
 
+    func playlist(id: String) -> LibraryPlaylist? { playlists.first { $0.id == id } }
     func playlist(at folder: URL) -> LibraryPlaylist? {
-        playlists.first { $0.folder == folder }
+        playlists.first { $0.folder.standardizedFileURL == folder.standardizedFileURL }
+    }
+    var sets: [LibraryPlaylist] { playlists.filter(\.manifest.isSet) }
+
+    /// Finds a playlist previously downloaded from the same SoundCloud link.
+    func playlist(sourceID: String?, url: String) -> LibraryPlaylist? {
+        if let sourceID, let hit = playlists.first(where: { !$0.manifest.isSet && $0.manifest.sourceID == sourceID }) {
+            return hit
+        }
+        let key = Self.normalize(url)
+        return playlists.first { !$0.manifest.isSet && Self.normalize($0.manifest.sourceURL) == key }
+    }
+
+    static func normalize(_ url: String) -> String {
+        guard var c = URLComponents(string: url.trimmingCharacters(in: .whitespacesAndNewlines)) else { return url.lowercased() }
+        c.query = nil
+        c.fragment = nil
+        var host = (c.host ?? "").lowercased()
+        for prefix in ["www.", "m."] where host.hasPrefix(prefix) { host.removeFirst(prefix.count) }
+        var path = c.path.lowercased()
+        while path.hasSuffix("/") { path.removeLast() }
+        return host + path
+    }
+
+    /// The one way to change a playlist: edits the current copy, saves it, and publishes it,
+    /// so background work (song details, analysis) never overwrites someone's edits.
+    @discardableResult
+    func mutate(_ id: String, _ body: (inout PlaylistManifest, URL) -> Void) -> Bool {
+        guard let i = playlists.firstIndex(where: { $0.id == id }) else { return false }
+        var m = playlists[i].manifest
+        let folder = playlists[i].folder
+        body(&m, folder)
+        do {
+            try m.save(to: folder)
+            playlists[i].manifest = m
+            return true
+        } catch {
+            lastError = "Couldn't save changes: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    /// Points a playlist at its folder's new location after a rename.
+    func relocate(_ id: String, to folder: URL) {
+        guard let i = playlists.firstIndex(where: { $0.id == id }) else { return }
+        playlists[i].folder = folder
     }
 
     func moveToTrash(_ playlist: LibraryPlaylist) {
@@ -31,23 +91,25 @@ final class Library: ObservableObject {
         reload()
     }
 
+    // MARK: Song details
+
     /// Fills in release dates, genres, albums and high-resolution covers from Apple's public catalog.
-    func enrich(folder: URL) {
-        guard !enriching.contains(folder) else { return }
-        enriching.insert(folder)
+    func enrich(_ id: String) {
+        guard !enriching.contains(id) else { return }
+        enriching.insert(id)
         Task {
-            defer { enriching.remove(folder) }
-            guard var manifest = PlaylistManifest.load(from: folder) else { return }
-            for i in manifest.tracks.indices where manifest.tracks[i].catalogChecked != true {
-                let t = manifest.tracks[i]
-                if var match = await Catalog.shared.lookup(title: t.title, artist: t.artist) {
-                    match.artworkFile = await Catalog.saveArtwork(match, trackID: t.id, folder: folder)
-                    manifest.tracks[i].catalog = match
+            defer { enriching.remove(id) }
+            let pending = playlist(id: id)?.manifest.tracks.filter { $0.catalogChecked != true } ?? []
+            for t in pending {
+                var match = await Catalog.shared.lookup(title: t.title, artist: t.artist)
+                if var m = match, let folder = playlist(id: id)?.folder {
+                    m.artworkFile = await Catalog.saveArtwork(m, trackID: t.id, folder: folder)
+                    match = m
                 }
-                manifest.tracks[i].catalogChecked = true
-                try? manifest.save(to: folder)
-                if let idx = playlists.firstIndex(where: { $0.folder == folder }) {
-                    playlists[idx].manifest = manifest
+                mutate(id) { manifest, _ in
+                    guard let j = manifest.tracks.firstIndex(where: { $0.id == t.id }) else { return }
+                    if let match { manifest.tracks[j].catalog = match }
+                    manifest.tracks[j].catalogChecked = true
                 }
             }
         }
@@ -55,9 +117,70 @@ final class Library: ObservableObject {
 
     func enrichAllPending() {
         for p in playlists where p.manifest.tracks.contains(where: { $0.catalogChecked != true }) {
-            enrich(folder: p.folder)
+            enrich(p.id)
         }
     }
+
+    // MARK: BPM and key
+
+    func isAnalyzing(_ playlistID: String, _ trackID: String) -> Bool {
+        analyzing.contains("\(playlistID)/\(trackID)")
+    }
+
+    func isQueued(_ playlistID: String, _ trackID: String) -> Bool {
+        queued.contains("\(playlistID)/\(trackID)")
+    }
+
+    /// Queues every song that hasn't been analyzed yet (or was analyzed by an older version).
+    func analyzePending() {
+        for p in playlists {
+            for t in p.manifest.orderedTracks where t.needsAnalysis { enqueue(p.id, t.id) }
+        }
+    }
+
+    func reanalyze(_ playlistID: String, _ trackIDs: [String]) {
+        mutate(playlistID) { m, _ in
+            for i in m.tracks.indices where trackIDs.contains(m.tracks[i].id) {
+                m.tracks[i].analysisEdited = nil
+                m.tracks[i].analysisVersion = nil
+            }
+        }
+        for id in trackIDs { enqueue(playlistID, id) }
+    }
+
+    private func enqueue(_ playlistID: String, _ trackID: String) {
+        let key = "\(playlistID)/\(trackID)"
+        guard !queued.contains(key) else { return }
+        queued.insert(key)
+        analysisQueue.append((playlistID, trackID))
+        objectWillChange.send()
+        // Two at a time keeps the Mac responsive while still getting through big playlists quickly.
+        while analysisWorkers < 2 && !analysisQueue.isEmpty {
+            analysisWorkers += 1
+            Task { await analysisWorker() }
+        }
+    }
+
+    private func analysisWorker() async {
+        defer { analysisWorkers -= 1 }
+        while !analysisQueue.isEmpty {
+            let item = analysisQueue.removeFirst()
+            let key = "\(item.playlist)/\(item.track)"
+            defer { queued.remove(key); analyzing.remove(key) }
+            guard let tools = Tools.locate(),
+                  let p = playlist(id: item.playlist),
+                  let t = p.manifest.tracks.first(where: { $0.id == item.track }), t.needsAnalysis else { continue }
+            analyzing.insert(key)
+            let result = try? await Analyzer.analyze(file: p.fileURL(for: t), duration: t.duration, ffmpeg: tools.ffmpeg)
+            mutate(item.playlist) { m, _ in
+                guard let j = m.tracks.firstIndex(where: { $0.id == item.track }), m.tracks[j].analysisEdited != true else { return }
+                m.tracks[j].analysis = result
+                m.tracks[j].analysisVersion = Analyzer.version
+            }
+        }
+    }
+
+    var pendingAnalysisCount: Int { queued.count }
 }
 
 /// Looks songs up in the iTunes Search API (free, no account needed).

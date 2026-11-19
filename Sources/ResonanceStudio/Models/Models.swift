@@ -86,15 +86,48 @@ struct TrackMeta: Codable, Identifiable, Hashable {
     var artworkFile: String?
     var catalog: CatalogMatch?
     var catalogChecked: Bool?
+    /// Detected tempo and key.
+    var analysis: AudioAnalysis?
+    var analysisVersion: Int?
+    /// True once someone corrects the BPM or key by hand, so re-analysis never overwrites it.
+    var analysisEdited: Bool?
+    /// Sub-folder inside the playlist folder, or nil for the playlist's main folder.
+    var folder: String?
 
     var displayArtist: String { catalog?.artistName ?? artist }
     var displayAlbum: String? { catalog?.albumName ?? album }
     var displayGenre: String? { genre?.nilIfBlank ?? catalog?.genre }
     var displayDate: Date? { catalog?.releaseDate ?? uploadDate }
+    var bpm: Double? { analysis.flatMap { $0.bpm > 0 ? $0.bpm : nil } }
+    var camelot: String? { analysis?.camelot }
+    var needsAnalysis: Bool { analysisEdited != true && (analysisVersion ?? 0) < Analyzer.version }
+
+    // Sort keys for the song table. Missing values sort last.
+    var sortTitle: String { title.lowercased() }
+    var sortArtist: String { displayArtist.lowercased() }
+    var sortAlbum: String { displayAlbum?.lowercased() ?? "\u{10FFFF}" }
+    var sortGenre: String { displayGenre?.lowercased() ?? "\u{10FFFF}" }
+    var sortDate: Date { displayDate ?? .distantFuture }
+    var sortDuration: Double { duration ?? .greatestFiniteMagnitude }
+    var sortBPM: Double { bpm ?? .greatestFiniteMagnitude }
+    var sortKey: Int { Analyzer.camelotOrder(camelot) }
+    var sortFolder: String { folder?.lowercased() ?? "" }
+    var sortPlays: Int { -(playCount ?? -1) }
 }
 
 struct PlaylistManifest: Codable, Hashable {
     var version = 1
+    /// Stable identity, so a playlist keeps its place in the app when its folder is renamed.
+    var uid: String?
+    /// "set" for sets made in the app; nil for SoundCloud downloads.
+    var kind: String?
+    /// SoundCloud's own id for the playlist or song, used to recognise it when added again.
+    var sourceID: String?
+    var updatedAt: Date?
+    /// Sub-folders, in the order they're shown.
+    var folders: [String]?
+    /// Songs the person deleted, so updates from SoundCloud don't bring them back.
+    var removedIDs: [String]?
     var title: String
     var uploader: String?
     var sourceURL: String
@@ -105,6 +138,17 @@ struct PlaylistManifest: Codable, Hashable {
     var tracks: [TrackMeta]
 
     var totalDuration: Double { tracks.compactMap(\.duration).reduce(0, +) }
+    var isSet: Bool { kind == "set" }
+    var folderList: [String] { folders ?? [] }
+    var lastChanged: Date { updatedAt ?? downloadedAt }
+    var formatLabel: String {
+        if isSet {
+            let formats = Set(tracks.map { ($0.fileName as NSString).pathExtension.lowercased() })
+            return formats.count == 1 ? (formats.first ?? "").uppercased() : "Mixed"
+        }
+        return format.title
+    }
+    var orderedTracks: [TrackMeta] { tracks.sorted { $0.index < $1.index } }
 
     static let fileName = "playlist.json"
 
@@ -125,7 +169,7 @@ struct PlaylistManifest: Codable, Hashable {
 struct LibraryPlaylist: Identifiable, Hashable {
     var folder: URL
     var manifest: PlaylistManifest
-    var id: URL { folder }
+    var id: String { manifest.uid ?? folder.path }
 
     var coverURL: URL? {
         let cover = folder.appendingPathComponent(".resonance/art/playlist.jpg")
@@ -134,6 +178,10 @@ struct LibraryPlaylist: Identifiable, Hashable {
     }
 
     func fileURL(for track: TrackMeta) -> URL { folder.appendingPathComponent(track.fileName) }
+
+    func tracks(inFolder name: String?) -> [TrackMeta] {
+        manifest.orderedTracks.filter { name == nil || $0.folder == name }
+    }
 
     func artworkURL(for track: TrackMeta) -> URL? {
         track.artworkFile.map { folder.appendingPathComponent(".resonance/art/\($0)") }
@@ -182,6 +230,10 @@ enum Fmt {
         let minutes = Int((seconds / 60).rounded())
         if minutes < 60 { return "\(minutes) min" }
         return "\(minutes / 60) hr \(minutes % 60) min"
+    }
+
+    static func bpm(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(format: "%.1f", value)
     }
 
     static func count(_ n: Int?) -> String? {

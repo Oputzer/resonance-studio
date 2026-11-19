@@ -36,7 +36,17 @@ final class Player: ObservableObject {
         load(i)
     }
 
-    func isCurrent(_ file: URL) -> Bool { current?.file == file }
+    func isCurrent(_ file: URL) -> Bool { current?.file.standardizedFileURL == file.standardizedFileURL }
+
+    /// Keeps the queue pointing at files after they're renamed or moved.
+    func remap(_ map: [URL: URL]) {
+        guard !map.isEmpty else { return }
+        let lookup = Dictionary(map.map { ($0.key.standardizedFileURL, $0.value) }, uniquingKeysWith: { a, _ in a })
+        queue = queue.map { item in
+            guard let new = lookup[item.file.standardizedFileURL] else { return item }
+            return QueueItem(file: new, title: item.title, artist: item.artist, artwork: item.artwork)
+        }
+    }
 
     func toggle() {
         guard current != nil else { return }

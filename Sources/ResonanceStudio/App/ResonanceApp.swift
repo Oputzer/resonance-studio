@@ -13,6 +13,15 @@ enum Entry {
             MainActor.assumeIsolated { BrandRenderer.renderLogo(to: URL(fileURLWithPath: args[i + 1])) }
             exit(0)
         }
+        if let i = args.firstIndex(of: "--selftest-organize"), i + 1 < args.count {
+            MainActor.assumeIsolated { SelfTest.organize(url: args[i + 1]) }
+            RunLoop.main.run()
+        }
+        if let i = args.firstIndex(of: "--selftest-analyze") {
+            let files = Array(args[(i + 1)...])
+            MainActor.assumeIsolated { SelfTest.analyze(files: files) }
+            RunLoop.main.run()
+        }
         if args.contains("--selftest-tools") {
             MainActor.assumeIsolated { SelfTest.installTools() }
             RunLoop.main.run()
